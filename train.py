@@ -348,7 +348,7 @@ def train(args : argparse.Namespace) -> None:
         if best_score < eval_result['joint_goal_accuracy']:
             print("Update Best checkpoint!")
             best_score = eval_result['joint_goal_accuracy']
-            best_checkpoint = epoch
+            best_checkpoint = epoch + 1
             delete_model(model_dir)
             torch.save(model.state_dict(), f"{model_dir}/model-{epoch + 1}.bin")
         
