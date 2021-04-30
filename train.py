@@ -343,7 +343,7 @@ def train(args : argparse.Namespace) -> None:
         eval_result = _evaluation(predictions, dev_labels, slot_meta)
         for k, v in eval_result.items():
             print(f"{k}: {v}")
-            wandb.log({f"{k}" : v})
+            wandb.log({f"{k}" : v, 'epochs' : epoch + 1}, commit = False)
 
         if best_score < eval_result['joint_goal_accuracy']:
             print("Update Best checkpoint!")
@@ -352,7 +352,6 @@ def train(args : argparse.Namespace) -> None:
             delete_model(model_dir)
             torch.save(model.state_dict(), f"{model_dir}/model-{epoch + 1}.bin")
         
-        # torch.save(model.state_dict(), f"{model_dir}/model-{epoch}.pth")
     print(f"Best checkpoint: {model_dir}/model-{best_checkpoint}.bin")
 
 if __name__ == "__main__":
