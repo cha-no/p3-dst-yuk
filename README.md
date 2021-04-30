@@ -47,6 +47,7 @@ hyperparameter|default|
 |distance_metric|"euclidean"|
 
 ## usage
+- train 할 때 architecture 변경해주면 됩니다
 ```python
 # train
 ## TRADE train (batch_size 32도 가능한 것 같습니다)
