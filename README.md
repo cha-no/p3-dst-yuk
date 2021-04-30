@@ -1,5 +1,7 @@
 # p3-dst-yuk
 - baseline 코드
+- SUMBT 추가했습니다
+- wandb 연동했습니다
 
 ## argument
 
