@@ -438,7 +438,7 @@ class SUMBT(nn.Module):
 
         # Attended utterance vector
         hidden = self.attn(
-            hid_slot,  # q^s  [J*M*B, N, H]
+            hid_slot,  # q^s  [J*M*B, H]
             hidden,  # U [J*M*B, N, H]
             hidden,  # U [J*M*B, N, H]
             mask=attention_mask.view(-1, 1, self.max_seq_length).repeat(slot_dim, 1, 1),
@@ -470,7 +470,7 @@ class SUMBT(nn.Module):
             rnn_out, _ = self.nbt(hidden, (h, c))  # [slot_dim*ds, turn, hidden]
         rnn_out = self.layer_norm(self.linear(self.dropout(rnn_out)))
 
-        hidden = rnn_out.view(slot_dim, ds, ts, -1)  # [J, B, M, H_GRU]
+        hidden = rnn_out.view(slot_dim, ds, ts, -1)  # [J, B, M, H]
 
         # Label (slot-value) encoding
         loss = 0
