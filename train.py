@@ -3,6 +3,9 @@ from importlib import import_module
 from pathlib import Path
 
 import os
+import sys
+sys.path.append(os.path.abspath('./KoBERT-Transformers'))
+
 import glob
 import json
 
@@ -15,6 +18,7 @@ import torch.nn as nn
 from torch.utils.data import DataLoader, RandomSampler, SequentialSampler
 import transformers
 from transformers import AdamW, BertTokenizer, get_linear_schedule_with_warmup
+from tokenization_kobert import KoBertTokenizer
 
 import wandb
 
@@ -226,7 +230,13 @@ def train(args : argparse.Namespace) -> None:
     )
 
     # Define Preprocessor
-    tokenizer = BertTokenizer.from_pretrained(args.model_name_or_path)
+    model_name_or_path = args.model_name_or_path
+    if model_name_or_path == "monologg/kobert":
+        tokenizer = KoBertTokenizer.from_pretrained(model_name_or_path)
+    else:
+        #tokenizer = AutoTokenizer.from_pretrained(MODEL_NAME)
+        tokenizer = BertTokenizer.from_pretrained(args.model_name_or_path)
+
     if args.architecture == 'TRADE':
         processor = TRADEPreprocessor(slot_meta, tokenizer)
         args.vocab_size = len(tokenizer)
@@ -314,6 +324,7 @@ def train(args : argparse.Namespace) -> None:
     )
     
     # Train
+    print("This notebook use [%s]."%(device))
     best_score, best_checkpoint = 0, 0
     for epoch in range(n_epochs):
         model.train()
