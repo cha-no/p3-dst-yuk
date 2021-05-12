@@ -23,6 +23,7 @@ hyperparameter|default|
 |group_decay|True|
 |weight_decay|0.01|
 |max_seq_length|64|
+|word_dropout|0.0|
 |max_label_length|12|
 |train_batch_size|8|
 |eval_batch_size|8|
