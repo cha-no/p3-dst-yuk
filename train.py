@@ -17,7 +17,7 @@ import torch
 import torch.nn as nn
 from torch.utils.data import DataLoader, RandomSampler, SequentialSampler
 import transformers
-from transformers import AdamW, BertTokenizer, get_linear_schedule_with_warmup
+from transformers import AdamW, BertTokenizer, BertConfig, get_linear_schedule_with_warmup
 from tokenization_kobert import KoBertTokenizer
 
 import wandb
@@ -91,13 +91,17 @@ def set_model(args : argparse.Namespace, tokenizer : BertTokenizer, ontology : d
         tokenized_slot_meta = []
         for slot in slot_meta:
             tokenized_slot_meta.append(
-                tokenizer.encode(slot.replace("-", " "), add_special_tokens=False)
+                tokenizer.encode(slot.replace("-", " "), add_special_tokens = False)
             )
         
         # Model 선언
-        model = TRADE(args, tokenized_slot_meta)
-        model.set_subword_embedding(args.model_name_or_path)  # Subword Embedding 초기화
-        print(f"Subword Embeddings is loaded from {args.model_name_or_path}")
+        config = BertConfig.from_pretrained(args.model_name_or_path)
+        config.model_name_or_path = args.model_name_or_path
+        config.n_gate = args.n_gate
+        config.proj_dim = args.proj_dim
+        model = TRADE(config, tokenized_slot_meta)
+        # model.set_subword_embedding(args.model_name_or_path)  # Subword Embedding 초기화
+        # print(f"Subword Embeddings is loaded from {args.model_name_or_path}")
         print("Model is initialized")
     elif args.architecture == 'SUMBT':
         slot_type_ids, slot_values_ids = tokenize_ontology(ontology, tokenizer, args.max_label_length)
@@ -153,7 +157,8 @@ def get_loss(args : argparse.Namespace, model : nn.Module, batch : int, n_gpu : 
             gating_ids.contiguous().view(-1),
         )
         loss = loss_1 + loss_2
-    
+        return loss, loss_1, loss_2
+
     elif args.architecture == 'SUMBT':
         input_ids, segment_ids, input_masks, target_ids, num_turns, guids  = \
         [b.to(device) if not isinstance(b, list) else b for b in batch]
@@ -164,7 +169,7 @@ def get_loss(args : argparse.Namespace, model : nn.Module, batch : int, n_gpu : 
         else:
             loss, _, acc, acc_slot, _ = model(input_ids, segment_ids, input_masks, target_ids, n_gpu)
     
-    return loss
+        return loss
 
 
 def get_lr(optimizer : transformers.optimization) -> float:
@@ -238,23 +243,26 @@ def train(args : argparse.Namespace) -> None:
         tokenizer = BertTokenizer.from_pretrained(args.model_name_or_path)
 
     if args.architecture == 'TRADE':
-        processor = TRADEPreprocessor(slot_meta, tokenizer)
+        processor = TRADEPreprocessor(slot_meta, 
+                                    tokenizer,
+                                    max_seq_length = args.max_seq_length,
+                                    word_dropout = args.word_dropout)
         args.vocab_size = len(tokenizer)
         args.n_gate = len(processor.gating2id) # gating 갯수 none, dontcare, ptr
-
     elif args.architecture == 'SUMBT':
         max_turn = max([len(e['dialogue']) for e in train_data])
         processor = SUMBTPreprocessor(slot_meta,
                                     tokenizer,
                                     ontology = ontology,  # predefined ontology
                                     max_seq_length = args.max_seq_length,  # 각 turn마다 최대 길이
-                                    max_turn_length = max_turn)  # 각 dialogue의 최대 turn 길이
+                                    max_turn_length = max_turn,
+                                    word_dropout = args.word_dropout)  # 각 dialogue의 최대 turn 길이
         args.max_turn = max_turn
 
     # Extracting Featrues
     train_features = processor.convert_examples_to_features(train_examples)
     dev_features = processor.convert_examples_to_features(dev_examples)
-    
+
     model = set_model(args, tokenizer, ontology, slot_meta, device)
     model.to(device)
 
@@ -331,7 +339,10 @@ def train(args : argparse.Namespace) -> None:
         train_loss = AverageMeter()
 
         for step, batch in enumerate(train_loader):
-            loss = get_loss(args, model, batch, n_gpu, tokenizer, device, loss_fnc_1, loss_fnc_2)
+            if args.architecture == 'TRADE':
+                loss, loss_1, loss_2 = get_loss(args, model, batch, n_gpu, tokenizer, device, loss_fnc_1, loss_fnc_2)
+            elif args.architecture == 'SUMBT':
+                loss = get_loss(args, model, batch, n_gpu, tokenizer, device, loss_fnc_1, loss_fnc_2)
 
             loss.backward()
             nn.utils.clip_grad_norm_(model.parameters(), args.max_grad_norm)
@@ -345,10 +356,16 @@ def train(args : argparse.Namespace) -> None:
 
             if step % 100 == 0:
                 current_lr = get_lr(optimizer)
-                print(
-                    f"[{epoch + 1}/{n_epochs}] [{step}/{len(train_loader)}] loss : {loss.item()}  lr : {current_lr}"
-                )
-                wandb.log({"Train loss" : train_loss.avg})
+                if args.architecture == 'TRADE':
+                    print(
+                        f"[{epoch + 1}/{n_epochs}] [{step}/{len(train_loader)}] loss : {loss.item()} gen : {loss_1.item()} gate : {loss_2.item()}  lr : {current_lr}"
+                    )
+                    wandb.log({"Train loss" : train_loss.avg})
+                elif args.architecture == 'SUMBT':
+                    print(
+                        f"[{epoch + 1}/{n_epochs}] [{step}/{len(train_loader)}] loss : {loss.item()}  lr : {current_lr}"
+                    )
+                    wandb.log({"Train loss" : train_loss.avg})
 
         predictions = inference(args, model, dev_loader, processor, n_gpu, device)
         eval_result = _evaluation(predictions, dev_labels, slot_meta)
@@ -374,7 +391,8 @@ if __name__ == "__main__":
     parser.add_argument("--architecture", type = str, default = "TRADE")
     parser.add_argument("--group_decay", type = bool, default = True)
     parser.add_argument("--weight_decay", type = float, default = 0.01)
-    parser.add_argument("--max_seq_length", type = int, default = 64)
+    parser.add_argument("--max_seq_length", type = int, default = 512)
+    parser.add_argument("--word_dropout", type = float, default = 0.0)
     parser.add_argument("--max_label_length", type = int, default = 12)
     parser.add_argument("--train_batch_size", type = int, default = 8)
     parser.add_argument("--eval_batch_size", type = int, default = 8)
