@@ -26,14 +26,18 @@ def masked_cross_entropy_for_value(logits, target, pad_idx=0):
 class TRADE(nn.Module):
     def __init__(self, config, tokenized_slot_meta, pad_idx=0):
         super(TRADE, self).__init__()
-        self.encoder = GRUEncoder(
-            config.vocab_size,
-            config.hidden_size,
-            1,
-            config.hidden_dropout_prob,
-            config.proj_dim,
-            pad_idx,
-        )
+        # self.encoder = GRUEncoder(
+        #     config.vocab_size,
+        #     config.hidden_size,
+        #     1,
+        #     config.hidden_dropout_prob,
+        #     config.proj_dim,
+        #     pad_idx,
+        # )
+        if config.model_name_or_path:
+            self.encoder = BertModel.from_pretrained(config.model_name_or_path)
+        else:
+            self.encoder = BertModel(config)
 
         self.decoder = SlotGenerator(
             config.vocab_size,
@@ -48,14 +52,17 @@ class TRADE(nn.Module):
         self.tie_weight()
         
     def set_subword_embedding(self, model_name_or_path):
-        model = ElectraModel.from_pretrained(model_name_or_path)
+        model = BertModel.from_pretrained(model_name_or_path)
         self.encoder.embed.weight = model.embeddings.word_embeddings.weight
         self.tie_weight()
 
     def tie_weight(self):
-        self.decoder.embed.weight = self.encoder.embed.weight
-        if self.decoder.proj_layer:
-            self.decoder.proj_layer.weight = self.encoder.proj_layer.weight
+        self.decoder.embed.weight = self.encoder.embeddings.word_embeddings.weight
+
+    # def tie_weight(self):
+    #     self.decoder.embed.weight = self.encoder.embed.weight
+    #     if self.decoder.proj_layer:
+    #         self.decoder.proj_layer.weight = self.encoder.proj_layer.weight
 
     def forward(
         self, input_ids, token_type_ids, attention_mask=None, max_len=10, teacher=None
@@ -157,13 +164,11 @@ class SlotGenerator(nn.Module):
         # J, slot_meta : key : [domain, slot] ex> LongTensor([1,2])
         # J,2
         batch_size = encoder_output.size(0)
-        slot = torch.LongTensor(self.slot_embed_idx).to(input_ids.device)  ##
+        slot = torch.LongTensor(self.slot_embed_idx).to(input_ids.device)
         slot_e = torch.sum(self.embedding(slot), 1)  # J,d
         J = slot_e.size(0)
 
-        all_point_outputs = torch.zeros(batch_size, J, max_len, self.vocab_size).to(
-            input_ids.device
-        )
+        all_point_outputs = torch.zeros(batch_size, J, max_len, self.vocab_size, device = input_ids.device)
         
         # Parallel Decoding
         w = slot_e.repeat(batch_size, 1).unsqueeze(1)
@@ -198,13 +203,14 @@ class SlotGenerator(nn.Module):
             )  # B,1
             p_gen = p_gen.squeeze(-1)
 
-            p_context_ptr = torch.zeros_like(attn_vocab).to(input_ids.device)
+            p_context_ptr = torch.zeros_like(attn_vocab, device = input_ids.device)
             p_context_ptr.scatter_add_(1, input_ids, attn_history)  # copy B,V
             p_final = p_gen * attn_vocab + (1 - p_gen) * p_context_ptr  # B,V
             _, w_idx = p_final.max(-1)
 
             if teacher is not None:
-                w = self.embedding(teacher[:, :, k]).transpose(0, 1).reshape(batch_size * J, 1, -1)
+                # w = self.embedding(teacher[:, :, k]).transpose(0, 1).reshape(batch_size * J, 1, -1)
+                w = self.embedding(teacher[:, :, k]).reshape(batch_size * J, 1, -1)
             else:
                 w = self.embedding(w_idx).unsqueeze(1)  # B,1,D
             if k == 0:
