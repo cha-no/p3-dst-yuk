@@ -1,3 +1,4 @@
+import numpy as np
 import torch
 
 from data_utils import (
@@ -16,23 +17,26 @@ class TRADEPreprocessor(DSTPreprocessor):
         trg_tokenizer=None,
         ontology=None,
         max_seq_length=512,
+        word_dropout=0.0,
     ):
         self.slot_meta = slot_meta
         self.src_tokenizer = src_tokenizer
         self.trg_tokenizer = trg_tokenizer if trg_tokenizer else src_tokenizer
         self.ontology = ontology
-        self.gating2id = {"none": 0, "dontcare": 1, "ptr": 2}
+        # self.gating2id = {"none": 0, "dontcare": 1, "ptr": 2}
+        self.gating2id = {"none": 0, "dontcare": 1, "yes": 2, "no": 3, "ptr": 4}
         self.id2gating = {v: k for k, v in self.gating2id.items()}
         self.max_seq_length = max_seq_length
+        self.word_dropout = word_dropout
 
     def _convert_example_to_feature(self, example):
         dialogue_context = " [SEP] ".join(example.context_turns + example.current_turn)
 
         input_id = self.src_tokenizer.encode(dialogue_context, add_special_tokens=False)
-#         max_length = self.max_seq_length - 2
-#         if len(input_id) > max_length:
-#             gap = len(input_id) - max_length
-#             input_id = input_id[gap:]
+        max_length = self.max_seq_length - 2
+        if len(input_id) > max_length:
+            gap = len(input_id) - max_length
+            input_id = input_id[gap:]
 
         input_id = (
             [self.src_tokenizer.cls_token_id]
@@ -71,9 +75,13 @@ class TRADEPreprocessor(DSTPreprocessor):
             if self.id2gating[gate] == "none":
                 continue
 
-            if self.id2gating[gate] == "dontcare":
-                recovered.append("%s-%s" % (slot, "dontcare"))
+            if self.id2gating[gate] in ["dontcare", "yes", "no"]:
+                recovered.append("%s-%s" % (slot, self.id2gating[gate]))
                 continue
+
+            # if self.id2gating[gate] == "dontcare":
+            #     recovered.append("%s-%s" % (slot, "dontcare"))
+            #     continue
 
             token_id_list = []
             for id_ in value:
@@ -91,9 +99,25 @@ class TRADEPreprocessor(DSTPreprocessor):
 
     def collate_fn(self, batch):
         guids = [b.guid for b in batch]
-        input_ids = torch.LongTensor(
-            self.pad_ids([b.input_id for b in batch], self.src_tokenizer.pad_token_id)
-        )
+
+        if self.word_dropout > 0.0:
+            input_ids = []
+            for b in batch:
+                drop_mask = (np.array(self.src_tokenizer.get_special_tokens_mask(b.input_id, already_has_special_tokens=True)) == 0).astype(int)
+                word_drop = np.random.binomial(drop_mask, self.word_dropout)
+                input_id = [
+                    token_id if word_drop[i] == 0 else self.src_tokenizer.unk_token_id
+                    for i, token_id in enumerate(b.input_id)
+                ]
+                input_ids.append(input_id) 
+            input_ids = torch.LongTensor(
+                self.pad_ids([b for b in input_ids], self.src_tokenizer.pad_token_id)
+            )
+        else:
+            input_ids = torch.LongTensor(
+                self.pad_ids([b.input_id for b in batch], self.src_tokenizer.pad_token_id)
+            )
+
         segment_ids = torch.LongTensor(
             self.pad_ids([b.segment_id for b in batch], self.src_tokenizer.pad_token_id)
         )
@@ -116,6 +140,7 @@ class SUMBTPreprocessor(DSTPreprocessor):
         ontology=None,
         max_seq_length=64,
         max_turn_length=14,
+        word_dropout=0.0,
     ):
         self.slot_meta = slot_meta
         self.src_tokenizer = src_tokenizer
@@ -123,6 +148,7 @@ class SUMBTPreprocessor(DSTPreprocessor):
         self.ontology = ontology
         self.max_seq_length = max_seq_length
         self.max_turn_length = max_turn_length
+        self.word_dropout = word_dropout
 
     def _convert_example_to_feature(self, example):
         guid = example[0].guid.rsplit("-", 1)[0]  # dialogue_idx
@@ -199,7 +225,26 @@ class SUMBTPreprocessor(DSTPreprocessor):
 
     def collate_fn(self, batch):
         guids = [b.guid for b in batch]
-        input_ids = torch.LongTensor([b.input_ids for b in batch])
+
+        if self.word_dropout > 0.0:
+            input_ids = []
+            for b in batch:
+                drop_mask = (np.array(self.src_tokenizer.get_special_tokens_mask(b.input_id, already_has_special_tokens=True)) == 0).astype(int)
+                word_drop = np.random.binomial(drop_mask, self.word_dropout)
+                input_id = [
+                    token_id if word_drop[i] == 0 else self.src_tokenizer.unk_token_id
+                    for i, token_id in enumerate(b.input_id)
+                ]
+                input_ids.append(input_id) 
+            input_ids = torch.LongTensor(
+                self.pad_ids([b for b in input_ids], self.src_tokenizer.pad_token_id)
+            )
+        else:
+            input_ids = torch.LongTensor(
+                self.pad_ids([b.input_id for b in batch], self.src_tokenizer.pad_token_id)
+            )
+
+        # input_ids = torch.LongTensor([b.input_ids for b in batch])
         segment_ids = torch.LongTensor([b.segment_ids for b in batch])
         input_masks = input_ids.ne(self.src_tokenizer.pad_token_id)
         target_ids = torch.LongTensor([b.target_ids for b in batch])
