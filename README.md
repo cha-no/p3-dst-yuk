@@ -3,12 +3,14 @@
 - baseline 코드
 - SUMBT 추가했습니다
 - wandb 연동했습니다
-### 변경
+### 변경1
 - TRADE encoder부분 bert로 바꾸었습니다
 - word_dropout 적용했습니다
 - TRADE에서 w부분 transpose 제외했습니다
 - max_seq_length 핸들링 코드 적용했습니다
-
+### 변경2
+- SOMDST 추가했습니다
+- 학습하면서 좋은 모델(JGA기준) 5개가 저장됩니다
 
 ## argument
 
