@@ -56,18 +56,25 @@ hyperparameter|default|
 |task_name|"sumbtgru"|
 |distance_metric|"euclidean"|
 
+### SOMDST argument
+
+hyperparameter|default|
+|:---:|:---:|
+|dec_learning_rate|1e-4|
+|exclude_domain|True|
+
 ## usage
 - train 할 때 architecture 변경해주면 됩니다
+- 생각보다 메모리를 적게 잡아먹어서 batch_size를 크게 해줘도 될 것 같습니다
+- batch_size를 너무 작게하면 loss가 nan이 되니깐 참고하시면 될 것 같습니다
 ```python
 # train
-## TRADE train (batch_size 32도 가능한 것 같습니다)
-python train.py --model_name_or_path "monologg/koelectra-base-v3-discriminator"
+## SOMDST train
+train.py --architecture SOMDST --model_name_or_path dsksd/bert-ko-small-minimal --num_train_epochs 50 --train_batch_size 16 --teacher_forcing_ratio 1.0 --num_workers 2
 
-## SUMBT train (batch_size 크면 gpu 에러나는 것 같습니다)
-python train.py --architecture SUMBT --model_name_or_path "dsksd/bert-ko-small-minimal"
 
 # infernece
 ## model의 path만 지정해주면 될 것 같습니다
-python inference.py --model_name "TRADE/model-2.pth"
+python inference.py --model_name "SOMDST/model-50.bin"
 
 ```
