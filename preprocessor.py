@@ -6,8 +6,14 @@ from data_utils import (
     OpenVocabDSTFeature,
     convert_state_dict,
     _truncate_seq_pair,
-    OntologyDSTFeature
+    OntologyDSTFeature,
+    SOMDSTFeature,
+    OP_SET,
+    EXPERIMENT_DOMAINS,
 )
+
+flatten = lambda x: [i for s in x for i in s]
+domain2id = {d: i for i, d in enumerate(EXPERIMENT_DOMAINS)}
 
 class TRADEPreprocessor(DSTPreprocessor):
     def __init__(
@@ -270,3 +276,141 @@ def tokenize_ontology(ontology, tokenizer, max_seq_length = 12):
             slot_value.append(token)
         slot_values.append(torch.LongTensor(slot_value))
     return torch.LongTensor(slot_types), slot_values
+        
+class SOMDSTPreprocessor(DSTPreprocessor):
+    def __init__(
+        self,
+        slot_meta,
+        src_tokenizer,
+        trg_tokenizer=None,
+        n_history = 1,
+        slot_token = '[SLOT]',
+        separate_token = ';',
+        ontology=None,
+        max_seq_length=512,
+        word_dropout=0.0,
+        op_code='4'
+    ):
+        self.slot_meta = slot_meta
+        self.src_tokenizer = src_tokenizer
+        self.trg_tokenizer = trg_tokenizer if trg_tokenizer else src_tokenizer
+        self.n_history = n_history
+        self.slot_token = slot_token
+        self.separate_token = separate_token
+        self.ontology = ontology
+        self.max_seq_length = max_seq_length
+        self.word_dropout = word_dropout
+        self.op2id = OP_SET[op_code]
+        self.op_ids = None
+        self.generate_ids = None        
+        
+        special_tokens_dict = {'additional_special_tokens': [slot_token, '[NULL]', '[EOS]']}
+        num_added_toks = self.src_tokenizer.add_special_tokens(special_tokens_dict)
+        
+    def _convert_example_to_feature(self, example):
+        max_seq_length = self.max_seq_length
+        state = []
+        
+        for s in self.slot_meta:
+            state.append(self.slot_token)
+            k = s.split('-')
+            v = example.last_dialog_state.get(s)
+            if v is not None:
+                k.extend(['-', v])
+                t = self.src_tokenizer.tokenize(' '.join(k))
+            else:
+                t = self.src_tokenizer.tokenize(' '.join(k))
+                t.extend(['-', '[NULL]'])
+            state.extend(t)
+        
+        dialog_history = self.separate_token.join(example.context_turns[-2 * self.n_history:])
+        turn_utter = self.separate_token.join(example.current_turn)
+        
+        avail_length_1 = max_seq_length - len(state) - 3
+        diag_1 = self.src_tokenizer.tokenize(dialog_history)
+        diag_2 = self.src_tokenizer.tokenize(turn_utter)
+        avail_length = avail_length_1 - len(diag_2)
+
+        if len(diag_1) > avail_length:  # truncated
+            avail_length = len(diag_1) - avail_length
+            diag_1 = diag_1[avail_length:]
+
+        if len(diag_1) == 0 and len(diag_2) > avail_length_1:
+            avail_length = len(diag_2) - avail_length_1
+            diag_2 = diag_2[avail_length:]
+
+        drop_mask = [0] + [1] * len(diag_1) + [0] + [1] * len(diag_2) + [0]
+        diag_1 = ["[CLS]"] + diag_1 + ["[SEP]"]
+        diag_2 = diag_2 + ["[SEP]"]
+        segment = [0] * len(diag_1) + [1] * len(diag_2)
+
+        diag = diag_1 + diag_2
+        # word dropout
+        if self.word_dropout > 0.:
+            drop_mask = np.array(drop_mask)
+            word_drop = np.random.binomial(drop_mask.astype('int64'), self.word_dropout)
+            diag = [w if word_drop[i] == 0 else '[UNK]' for i, w in enumerate(diag)]
+
+        input_ = diag + state
+        segment = segment + [1] * len(state)
+        self.input_ = input_
+
+        self.segment_id = segment
+        slot_position = []
+        for i, t in enumerate(self.input_):
+            if t == self.slot_token:
+                slot_position.append(i)
+        self.slot_position = slot_position
+
+        input_mask = [1] * len(self.input_)
+        self.input_id = self.src_tokenizer.convert_tokens_to_ids(self.input_)
+        if len(input_mask) < max_seq_length:
+            self.input_id = self.input_id + [0] * (max_seq_length-len(input_mask))
+            self.segment_id = self.segment_id + [0] * (max_seq_length-len(input_mask))
+            input_mask = input_mask + [0] * (max_seq_length-len(input_mask))
+
+        self.input_mask = input_mask
+        self.domain_id = domain2id[example.turn_domain]
+        if example.op_labels:
+            self.op_ids = [self.op2id[a] for a in example.op_labels]
+        if example.generate_y:
+            self.generate_ids = [self.src_tokenizer.convert_tokens_to_ids(y) for y in example.generate_y]
+        else:
+            self.generate_ids = []
+        return SOMDSTFeature(
+            example.guid, self.input_id, self.segment_id, self.input_mask,
+            self.slot_position, self.op_ids, self.domain_id, self.generate_ids, example.last_dialog_state, example.is_last_turn
+        )
+
+
+    def convert_examples_to_features(self, examples):
+        return list(map(self._convert_example_to_feature, examples))
+
+    def check_testdata(self, batch):
+        for b in batch:
+            if b.op_ids is not None:
+                return True
+            else:
+                return False
+        
+    def collate_fn(self, batch):
+        input_ids = torch.tensor([b.input_id for b in batch], dtype=torch.long)
+        input_mask = torch.tensor([b.input_mask for b in batch], dtype=torch.long)
+        segment_ids = torch.tensor([b.segment_id for b in batch], dtype=torch.long)
+        state_position_ids = torch.tensor([b.slot_position for b in batch], dtype=torch.long)
+        domain_ids = torch.tensor([b.domain_id for b in batch], dtype=torch.long)
+        if self.check_testdata(batch):
+            op_ids = torch.tensor([b.op_ids for b in batch], dtype=torch.long)
+            gen_ids = [b.generate_ids for b in batch]
+            max_update = max([len(b) for b in gen_ids])
+            max_value = max([len(b) for b in flatten(gen_ids)]) if flatten(gen_ids) else 0
+            for bid, b in enumerate(gen_ids):
+                n_update = len(b)
+                for idx, v in enumerate(b):
+                    b[idx] = v + [0] * (max_value - len(v))
+                gen_ids[bid] = b + [[0] * max_value] * (max_update - n_update)
+            gen_ids = torch.tensor(gen_ids, dtype=torch.long)
+        else:
+            op_ids, gen_ids, max_update, max_value = 0, 0, 0, 0
+        
+        return input_ids, input_mask, segment_ids, state_position_ids, op_ids, domain_ids, gen_ids, max_value, max_update
