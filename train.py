@@ -26,16 +26,26 @@ from data_utils import (
     WOSDataset,
     get_examples_from_dialogues,
     load_dataset,
+    convert_state_dict, 
+    DSTInputExample, 
+    OpenVocabDSTFeature, 
+    DSTPreprocessor,
+    SOMDSTFeature,
+    EXPERIMENT_DOMAINS,
+    OP_SET,
+    domain2id,
     set_seed
 )
 
 from eval_utils import DSTEvaluator, AverageMeter
 from evaluation import _evaluation
-from inference import inference
+from inference import inference, SomDst_inference
 from model import *
 from preprocessor import *
 
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+op_code = '4'
+op2id = OP_SET[op_code]
 
 def set_wandb(args : argparse.Namespace) -> None:
     """
@@ -54,6 +64,16 @@ def set_wandb(args : argparse.Namespace) -> None:
         project = 'exp', 
         config = config,
     )
+
+def str2bool(v):
+    if isinstance(v, bool):
+        return v
+    if v.lower() in ('yes', 'true', 't', 'y', '1'):
+        return True
+    elif v.lower() in ('no', 'false', 'f', 'n', '0'):
+        return False
+    else:
+        raise argparse.ArgumentTypeError('Boolean value expected.')
 
 def increment_path(path : str, exist_ok : bool = False) -> str:
     """
@@ -109,7 +129,19 @@ def set_model(args : argparse.Namespace, tokenizer : BertTokenizer, ontology : d
         args.num_labels = num_labels
         model = SUMBT(args, num_labels, device)
         model.initialize_slot_value_lookup(slot_values_ids, slot_type_ids)  # Tokenized Ontology의 Pre-encoding using BERT_SV
-    
+    elif args.architecture == 'SOMDST':
+        config = BertConfig.from_pretrained(args.model_name_or_path)
+        config.model_name_or_path = args.model_name_or_path
+        config.dropout = args.dropout
+        config.attention_probs_dropout_prob = args.dropout
+        config.hidden_dropout_prob = args.dropout
+        config.vocab_size = len(tokenizer)
+        args.vocab_size = len(tokenizer)
+        args.initializer_range = config.initializer_range
+        model = SomDST(config, len(op2id), len(domain2id), op2id['update'])
+        model.encoder.bert.embeddings.word_embeddings.weight.data[35000].normal_(mean=0.0, std=0.02)
+        model.encoder.bert.embeddings.word_embeddings.weight.data[35001].normal_(mean=0.0, std=0.02)
+        model.encoder.bert.embeddings.word_embeddings.weight.data[35002].normal_(mean=0.0, std=0.02)
     return model
 
 def get_loss(args : argparse.Namespace, model : nn.Module, batch : int, n_gpu : int, tokenizer : BertTokenizer, 
@@ -171,6 +203,41 @@ def get_loss(args : argparse.Namespace, model : nn.Module, batch : int, n_gpu : 
     
         return loss
 
+    if args.architecture == 'SOMDST':
+        batch = [b.to(device) if not isinstance(b, int) else b for b in batch]
+        input_ids, input_mask, segment_ids, state_position_ids, op_ids,\
+        domain_ids, gen_ids, max_value, max_update = batch
+        # teacher forcing
+        if (
+            args.teacher_forcing_ratio > 0.0
+            and random.random() < args.teacher_forcing_ratio
+        ):
+            tf = gen_ids
+        else:
+            tf = None
+
+        domain_scores, state_scores, gen_scores = model(input_ids=input_ids,
+                                                        token_type_ids=segment_ids,
+                                                        state_positions=state_position_ids,
+                                                        attention_mask=input_mask,
+                                                        max_value=max_value,
+                                                        op_ids=op_ids,
+                                                        max_update=max_update,
+                                                        teacher=tf)
+        loss_s = loss_fnc_2(state_scores.view(-1, len(op2id)), op_ids.view(-1))
+        loss_g = loss_fnc_1(gen_scores.contiguous(),
+                            gen_ids.contiguous(),
+                            tokenizer.vocab['[PAD]'])
+        loss = loss_s + loss_g
+
+        if args.exclude_domain is not True:
+            loss_d = loss_fnc_2(domain_scores.view(-1, len(domain2id)), domain_ids.view(-1))
+            loss = loss + loss_d
+        else:
+            loss_d = 0
+
+        return loss, loss_s, loss_g, loss_d
+
 
 def get_lr(optimizer : transformers.optimization) -> float:
     """
@@ -183,19 +250,65 @@ def get_lr(optimizer : transformers.optimization) -> float:
     for param_group in optimizer.param_groups:
         return param_group['lr']
 
-def delete_model(model_dir : str) -> None:
+def delete_model(model_dir : str, score : float, score_dict : dict, number : int) -> bool:
     """
-    Delete Model to save best Model
+    Delete model to save best number models
     Args:
         model_dir (str).
+        score (float).
+        score_dict (dict).
+        number (int). : num of models
     Return:
-        None.
+        flag (bool). : decide to save model
     """
-    file_list = os.listdir(model_dir)
-    for file in file_list:
-        if file.startswith('model'):
-            os.remove(os.path.join(model_dir, file))
-            break
+    if len(score_dict) >= number :
+        min_file_name, min_score = min(score_dict.items(), key = lambda x : x[1])
+        if score > min_score:
+            score_dict.pop(min_file_name)
+            os.remove(os.path.join(model_dir, min_file_name))
+            return True
+        else:
+            return False
+    else:
+        return True
+
+# def delete_model(model_dir : str) -> None:
+#     """
+#     Delete Model to save best Model
+#     Args:
+#         model_dir (str).
+#     Return:
+#         None.
+#     """
+#     file_list = os.listdir(model_dir)
+#     for file in file_list:
+#         if file.startswith('model'):
+#             os.remove(os.path.join(model_dir, file))
+#             break
+
+def mlm_pretrain(args, model, loader, optimizer, tokenizer, loss_fnc_pretrain, epoch):
+    model.train()
+    for step, batch in enumerate(loader):
+        input_ids, segment_ids, input_masks, gating_ids, target_ids, guids = [b.to(device) if not isinstance(b, list) else b for b in batch]
+
+        logits, labels = model.forward_pretrain(input_ids, tokenizer)
+        loss = loss_fnc_pretrain(logits.view(-1, args.vocab_size), labels.view(-1))
+
+        loss.backward()
+        nn.utils.clip_grad_norm_(model.parameters(), args.max_grad_norm)
+        optimizer.step()
+        optimizer.zero_grad()
+
+        if step % 100 == 0:
+            current_lr = get_lr(optimizer)
+            if args.mlm_during:
+                epochs = args.num_train_epochs
+            elif args.mlm_during:
+                epochs = args.num_pretrain_epochs
+            print(
+                f"[{epoch + 1}/{epochs}] [{step}/{len(loader)}] loss : {loss.item()}  lr : {current_lr}"
+            )
+
 
 def train(args : argparse.Namespace) -> None:
     """
@@ -222,19 +335,7 @@ def train(args : argparse.Namespace) -> None:
     ontology = json.load(open(f"{args.data_dir}/ontology.json"))
     train_data, dev_data, dev_labels = load_dataset(train_data_file)
 
-    if args.architecture == 'TRADE':
-        user_first, dialogue_level = False, False
-    elif args.architecture == 'SUMBT':
-        user_first, dialogue_level = True, True
-
-    train_examples = get_examples_from_dialogues(
-        train_data, user_first = user_first, dialogue_level = dialogue_level
-    )
-    dev_examples = get_examples_from_dialogues(
-        dev_data, user_first = user_first, dialogue_level = dialogue_level
-    )
-
-    # Define Preprocessor
+    # Define tokenizer
     model_name_or_path = args.model_name_or_path
     if model_name_or_path == "monologg/kobert":
         tokenizer = KoBertTokenizer.from_pretrained(model_name_or_path)
@@ -242,6 +343,19 @@ def train(args : argparse.Namespace) -> None:
         #tokenizer = AutoTokenizer.from_pretrained(MODEL_NAME)
         tokenizer = BertTokenizer.from_pretrained(args.model_name_or_path)
 
+    if args.architecture == 'TRADE' or args.architecture == 'SOMDST':
+        user_first, dialogue_level = False, False
+    elif args.architecture == 'SUMBT':
+        user_first, dialogue_level = True, True
+
+    train_examples = get_examples_from_dialogues(
+        train_data, slot_meta, user_first = user_first, dialogue_level = dialogue_level, tokenizer = tokenizer
+    )
+    dev_examples = get_examples_from_dialogues(
+        dev_data, slot_meta, dev_labels, user_first = user_first, dialogue_level = dialogue_level, tokenizer = tokenizer
+    )
+
+    # Define processor
     if args.architecture == 'TRADE':
         processor = TRADEPreprocessor(slot_meta, 
                                     tokenizer,
@@ -258,6 +372,13 @@ def train(args : argparse.Namespace) -> None:
                                     max_turn_length = max_turn,
                                     word_dropout = args.word_dropout)  # 각 dialogue의 최대 turn 길이
         args.max_turn = max_turn
+    elif args.architecture == 'SOMDST':
+        processor = SOMDSTPreprocessor(
+            slot_meta,
+            tokenizer,
+            max_seq_length=args.max_seq_length
+        )
+
 
     # Extracting Featrues
     train_features = processor.convert_examples_to_features(train_examples)
@@ -273,6 +394,7 @@ def train(args : argparse.Namespace) -> None:
         batch_size = args.train_batch_size,
         sampler = train_sampler,
         collate_fn = processor.collate_fn,
+        num_workers = args.num_workers
     )
     print("# train:", len(train_data))
 
@@ -285,9 +407,34 @@ def train(args : argparse.Namespace) -> None:
         collate_fn = processor.collate_fn,
     )
     print("# dev:", len(dev_data))
-    
+
+    n_gpu = 1 if torch.cuda.device_count() < 2 else torch.cuda.device_count()
+    n_epochs = args.num_train_epochs
+    t_total = len(train_loader) * n_epochs
+
     # Optimizer 및 Scheduler 선언
-    if args.group_decay:
+    if args.architecture == 'SOMDST':
+        no_decay = ['bias', 'LayerNorm.bias', 'LayerNorm.weight']
+        enc_param_optimizer = list(model.encoder.named_parameters())
+        enc_optimizer_grouped_parameters = [
+            {'params': [p for n, p in enc_param_optimizer if not any(nd in n for nd in no_decay)], 'weight_decay': 0.01},
+            {'params': [p for n, p in enc_param_optimizer if any(nd in n for nd in no_decay)], 'weight_decay': 0.0}
+            ]
+
+        warmup_steps = int(t_total * args.warmup_ratio)
+
+        enc_optimizer = AdamW(enc_optimizer_grouped_parameters, lr=args.learning_rate)
+        enc_scheduler = get_linear_schedule_with_warmup(
+                            enc_optimizer, num_warmup_steps=warmup_steps, num_training_steps=t_total
+                        )
+
+        dec_param_optimizer = list(model.decoder.parameters())
+        dec_optimizer = AdamW(dec_param_optimizer, lr=args.dec_learning_rate)
+        dec_scheduler = get_linear_schedule_with_warmup(
+                            dec_optimizer, num_warmup_steps=warmup_steps, num_training_steps=t_total
+                        )
+
+    else:
         no_decay = ["bias", "LayerNorm.weight"]
         optimizer_grouped_parameters = [
                 {
@@ -300,20 +447,18 @@ def train(args : argparse.Namespace) -> None:
                 },
             ]
         optimizer = AdamW(optimizer_grouped_parameters, lr = args.learning_rate, eps = args.adam_epsilon)
-    else:
-        optimizer = AdamW(model.parameters(), lr = args.learning_rate, eps = args.adam_epsilon, weight_decay = args.weight_decay)
 
-    n_gpu = 1 if torch.cuda.device_count() < 2 else torch.cuda.device_count()
-    n_epochs = args.num_train_epochs
-    t_total = len(train_loader) * n_epochs
-    warmup_steps = int(t_total * args.warmup_ratio)
-    scheduler = get_linear_schedule_with_warmup(
-        optimizer, num_warmup_steps = warmup_steps, num_training_steps = t_total
-    )
+        warmup_steps = int(t_total * args.warmup_ratio)
+        scheduler = get_linear_schedule_with_warmup(
+            optimizer, num_warmup_steps = warmup_steps, num_training_steps = t_total
+        )
 
-    # TRADE 일 때 사용
+    # TRADE, SOMDST 일 때 사용
     loss_fnc_1 = masked_cross_entropy_for_value  # generation
     loss_fnc_2 = nn.CrossEntropyLoss()  # gating
+    
+    # MLM pretrain
+    loss_fnc_pretrain = nn.CrossEntropyLoss()  # MLM pretrain
 
     if not os.path.exists(model_dir):
         os.mkdir(model_dir)
@@ -333,6 +478,13 @@ def train(args : argparse.Namespace) -> None:
     
     # Train
     print("This notebook use [%s]."%(device))
+    
+    if args.mlm_pre:
+        print('mlm_pretrain!!!')
+        for epoch in range(args.num_pretrain_epochs):
+            mlm_pretrain(args, model, train_loader, optimizer, tokenizer, loss_fnc_pretrain, epoch)
+
+    score_dict = {}
     best_score, best_checkpoint = 0, 0
     for epoch in range(n_epochs):
         model.train()
@@ -343,41 +495,82 @@ def train(args : argparse.Namespace) -> None:
                 loss, loss_1, loss_2 = get_loss(args, model, batch, n_gpu, tokenizer, device, loss_fnc_1, loss_fnc_2)
             elif args.architecture == 'SUMBT':
                 loss = get_loss(args, model, batch, n_gpu, tokenizer, device, loss_fnc_1, loss_fnc_2)
+            elif args.architecture == 'SOMDST':
+                loss, loss_s, loss_g, loss_d = get_loss(args, model, batch, n_gpu, tokenizer, device, loss_fnc_1, loss_fnc_2)
 
             loss.backward()
             nn.utils.clip_grad_norm_(model.parameters(), args.max_grad_norm)
-            optimizer.step()
-            scheduler.step()
-            optimizer.zero_grad()
-
-            wandb.log({"learning_rate" : get_lr(optimizer)})
+            if args.architecture == 'SOMDST':
+                enc_optimizer.step()
+                enc_scheduler.step()
+                dec_optimizer.step()
+                dec_scheduler.step()
+                model.zero_grad()
+                wandb.log({"learning_rate" : get_lr(enc_optimizer)})
+                wandb.log({"dec_learning_rate" : get_lr(dec_optimizer)})
+            else:
+                optimizer.step()
+                scheduler.step()
+                optimizer.zero_grad()
+                wandb.log({"learning_rate" : get_lr(optimizer)})
 
             train_loss.update(loss.item(), len(batch))
 
             if step % 100 == 0:
-                current_lr = get_lr(optimizer)
                 if args.architecture == 'TRADE':
+                    current_lr = get_lr(optimizer)
                     print(
                         f"[{epoch + 1}/{n_epochs}] [{step}/{len(train_loader)}] loss : {loss.item()} gen : {loss_1.item()} gate : {loss_2.item()}  lr : {current_lr}"
                     )
                     wandb.log({"Train loss" : train_loss.avg})
+                    wandb.log({"Train gen loss" : loss_1.item()})
+                    wandb.log({"Train gate loss" : loss_2.item()})
                 elif args.architecture == 'SUMBT':
+                    current_lr = get_lr(optimizer)
                     print(
                         f"[{epoch + 1}/{n_epochs}] [{step}/{len(train_loader)}] loss : {loss.item()}  lr : {current_lr}"
                     )
                     wandb.log({"Train loss" : train_loss.avg})
+                elif args.architecture == 'SOMDST':
+                    enc_current_lr = get_lr(enc_optimizer)
+                    dec_current_lr = get_lr(dec_optimizer)
+                    if args.exclude_domain is not True:
+                        print(
+                            f"[{epoch + 1}/{n_epochs}] [{step}/{len(train_loader)}] loss : {loss.item()} state_loss : {loss_s.item()} gen_loss : {loss_g.item()} dom_loss : {loss_d.item()} enc_lr : {enc_current_lr} dec_lr : {dec_current_lr}"
+                        )
+                        wandb.log({"Train loss" : train_loss.avg})
+                        wandb.log({"Train gen loss" : loss_g.item()})
+                        wandb.log({"Train state loss" : loss_s.item()})
+                        wandb.log({"Train domain loss" : loss_d.item()})
+                    else:
+                        print(
+                            f"[{epoch + 1}/{n_epochs}] [{step}/{len(train_loader)}] loss : {loss.item()} state_loss : {loss_s.item()} gen_loss : {loss_g.item()} enc_lr : {enc_current_lr} dec_lr : {dec_current_lr}"
+                        )
+                        wandb.log({"Train loss" : train_loss.avg})
+                        wandb.log({"Train gen loss" : loss_g.item()})
+                        wandb.log({"Train state loss" : loss_s.item()})
 
-        predictions = inference(args, model, dev_loader, processor, n_gpu, device)
+        if args.mlm_during:
+            print('mlm_pretrain!!!')
+            mlm_pretrain(args, model, train_loader, optimizer, tokenizer, loss_fnc_pretrain, epoch)
+
+        if args.architecture == 'SOMDST':
+            predictions = SomDst_inference(model, dev_examples, processor, slot_meta, tokenizer)
+        else:
+            predictions = inference(args, model, dev_loader, processor, n_gpu, device)
         eval_result = _evaluation(predictions, dev_labels, slot_meta)
         for k, v in eval_result.items():
             print(f"{k}: {v}")
             wandb.log({f"{k}" : v, 'epochs' : epoch + 1}, commit = False)
 
+        score = eval_result['joint_goal_accuracy']
         if best_score < eval_result['joint_goal_accuracy']:
             print("Update Best checkpoint!")
             best_score = eval_result['joint_goal_accuracy']
             best_checkpoint = epoch + 1
-            delete_model(model_dir)
+        
+        if delete_model(model_dir, score, score_dict, 5):    
+            score_dict[f'model-{epoch + 1}.bin'] = eval_result['joint_goal_accuracy']
             torch.save(model.state_dict(), f"{model_dir}/model-{epoch + 1}.bin")
         
     print(f"Best checkpoint: {model_dir}/model-{best_checkpoint}.bin")
@@ -389,18 +582,24 @@ if __name__ == "__main__":
     parser.add_argument("--data_dir", type = str, default = "/opt/ml/input/data/train_dataset")
     parser.add_argument("--model_dir", type=str, default = "models")
     parser.add_argument("--architecture", type = str, default = "TRADE")
+    parser.add_argument("--num_workers", type = int, default = 1)
     parser.add_argument("--group_decay", type = bool, default = True)
     parser.add_argument("--weight_decay", type = float, default = 0.01)
     parser.add_argument("--max_seq_length", type = int, default = 512)
+    parser.add_argument("--dropout", type = float, default = 0.1)
     parser.add_argument("--word_dropout", type = float, default = 0.0)
     parser.add_argument("--max_label_length", type = int, default = 12)
     parser.add_argument("--train_batch_size", type = int, default = 8)
     parser.add_argument("--eval_batch_size", type = int, default = 8)
+    parser.add_argument("--mlm_pre", type = bool, default = False)
+    parser.add_argument("--mlm_during", type = bool, default = False)
     parser.add_argument("--learning_rate", type = float, default = 5e-5)
     parser.add_argument("--adam_epsilon", type = float, default = 1e-8)
     parser.add_argument("--max_grad_norm", type = float, default = 1.0)
     parser.add_argument("--num_train_epochs", type = int, default = 10)
+    parser.add_argument("--num_pretrain_epochs", type = int, default = 3)
     parser.add_argument("--warmup_ratio", type = int, default = 0.1)
+    parser.add_argument("--teacher_forcing_ratio", type = float, default = 0.5)
     parser.add_argument(
         "--model_name_or_path",
         type = str,
@@ -410,16 +609,15 @@ if __name__ == "__main__":
 
     # TRADE Architecture Specific Argument
     parser.add_argument("--hidden_size", type = int, help = "GRU의 hidden size", default = 768)
-    parser.add_argument(
-        "--vocab_size",
-        type = int,
-        help = "vocab size, subword vocab tokenizer에 의해 특정된다",
-        default = None,
-    )
+    # parser.add_argument(
+    #     "--vocab_size",
+    #     type = int,
+    #     help = "vocab size, subword vocab tokenizer에 의해 특정된다",
+    #     default = None,
+    # )
     parser.add_argument("--hidden_dropout_prob", type = float, default = 0.1)
     parser.add_argument("--proj_dim", type = int,
                         help = "만약 지정되면 기존의 hidden_size는 embedding dimension으로 취급되고, proj_dim이 GRU의 hidden_size로 사용됨. hidden_size보다 작아야 함.", default=None)
-    parser.add_argument("--teacher_forcing_ratio", type = float, default = 0.5)
 
     # SUMBT Architecture Specific Argument
     parser.add_argument("--hidden_dim", type = int, help = "GRU의 hidden dimension", default = 300)
@@ -429,6 +627,10 @@ if __name__ == "__main__":
     parser.add_argument("--fix_utterance_encoder", type = bool, help = "utterance_encoder의 weight를 freeze 결정", default = False)
     parser.add_argument("--task_name", type = str, help = "이부분 baseline에서 쓰지 않았는데 일단 있어서 추가했습니다", default = 'sumbtgru')
     parser.add_argument("--distance_metric", type = str, help = "freeze된 value vector와의 거리를 구할 때 metric", default = 'euclidean')
+
+    # SOMDST Architecture Specific Argument
+    parser.add_argument("--dec_learning_rate", type = float, default = 1e-4)
+    parser.add_argument("--exclude_domain", type = str2bool, default = True)
 
     args = parser.parse_args()
 
