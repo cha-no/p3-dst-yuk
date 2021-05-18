@@ -609,12 +609,12 @@ if __name__ == "__main__":
 
     # TRADE Architecture Specific Argument
     parser.add_argument("--hidden_size", type = int, help = "GRU의 hidden size", default = 768)
-    # parser.add_argument(
-    #     "--vocab_size",
-    #     type = int,
-    #     help = "vocab size, subword vocab tokenizer에 의해 특정된다",
-    #     default = None,
-    # )
+    parser.add_argument(
+        "--vocab_size",
+        type = int,
+        help = "vocab size, subword vocab tokenizer에 의해 특정된다",
+        default = None,
+    )
     parser.add_argument("--hidden_dropout_prob", type = float, default = 0.1)
     parser.add_argument("--proj_dim", type = int,
                         help = "만약 지정되면 기존의 hidden_size는 embedding dimension으로 취급되고, proj_dim이 GRU의 hidden_size로 사용됨. hidden_size보다 작아야 함.", default=None)
