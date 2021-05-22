@@ -1,8 +1,14 @@
+"""Inference DST models
+
+    TRADE, TRADE(transformer decoder), SUMBT, SOMDST
+
+"""
+
 import argparse
 import os
 import json
 
-from typing import Any
+from typing import Tuple, List, Dict, Any
 
 from copy import deepcopy
 from tqdm import tqdm
@@ -12,7 +18,7 @@ import torch.nn as nn
 from torch.utils.data import DataLoader, SequentialSampler
 from transformers import BertTokenizer
 
-from data_utils import (WOSDataset, get_examples_from_dialogues)
+from utils.data_utils import (WOSDataset, get_examples_from_dialogues)
 from model import *
 from preprocessor import *
 
@@ -20,14 +26,36 @@ device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 op_code = '4'
 op2id = OP_SET[op_code]
 
-def postprocess_state(state):
+def postprocess_state(state : List[str]) -> List[str]:
+    """TRADE, SUMBT postprocessing
+
+    Args:
+        state (List[str]): state prediction
+
+    Returns:
+        List[str]: postprocessing state
+    """
     for i, s in enumerate(state):
         s = s.replace(" : ", ":")
-        state[i] = s.replace(" , ", ", ")
+        state[i] = s.replace(" , ", ", ").replace('( ', '(').replace(' )', ')').replace(' & ', '&').replace(' = ', '=')
     return state
 
-def postprocessing(slot_meta, ops, last_dialog_state,
-                   generated, tokenizer, op_code, gold_gen={}):
+def postprocessing(slot_meta : List[str], ops : List[str], last_dialog_state : Dict[str, str],
+                   generated : List, tokenizer : BertTokenizer, op_code : str, gold_gen : Dict = {}) -> Tuple[List, Dict]:
+    """SOMDST postprocessing
+
+    Args:
+        slot_meta (List[str])
+        ops (List[str]): predict operation label
+        last_dialog_state (Dict[str, str]): 
+        generated (List): predict gnerated id
+        tokenizer (BertTokenizer)
+        op_code (str)
+        gold_gen (Dict, optional): Ground truth label. Defaults to {}.
+
+    Returns:
+        Tuple[List, Dict]: [description]
+    """
     gid = 0
     for st, op in zip(slot_meta, ops):
         if op == 'dontcare' and OP_SET[op_code].get('dontcare') is not None:
@@ -47,7 +75,8 @@ def postprocessing(slot_meta, ops, last_dialog_state,
                 gen.append(gg)
             gen = ' '.join(gen).replace(' ##', '')
             gid += 1
-            gen = gen.replace(' : ', ':').replace('##', '')
+            gen = gen.replace(' : ', ':').replace('##', '').replace(" , ", ", ")
+            gen = gen.replace('( ', '(').replace(' )', ')').replace(' & ', '&').replace(' = ', '=')
             if gold_gen and gold_gen.get(st) and gold_gen[st] not in ['dontcare']:
                 gen = gold_gen[st]
 
@@ -108,13 +137,16 @@ def _inference(args : argparse.Namespace, model : nn.Module, batch : int, proces
     Return:
         predictions (dict).
     """
-    if args.architecture == 'TRADE':
+    if args.architecture == 'TRADE' or args.architecture == 'TRADE_transformer':
         input_ids, segment_ids, input_masks, gating_ids, target_ids, guids = [
             b.to(device) if not isinstance(b, list) else b for b in batch
         ]
 
         with torch.no_grad():
-            o, g = model(input_ids, segment_ids, input_masks, 9)
+            if args.architecture == 'TRADE':
+                o, g = model(input_ids, segment_ids, input_masks, 9)
+            else:
+                o, g = model.predict(input_ids=input_ids, max_len=9, token_type_ids=segment_ids, attention_mask=input_masks)
 
             _, generated_ids = o.max(-1)
             _, gated_ids = g.max(-1)
@@ -137,7 +169,7 @@ def _inference(args : argparse.Namespace, model : nn.Module, batch : int, proces
                 predictions[guids[i] + f'-{idx}'] = state
     return predictions
 
-def inference(args : argparse.Namespace, model : nn.Module, eval_loader : DataLoader, processor : Any, n_gpu : int, device : torch.device) -> dict:
+def inference(args : argparse.Namespace, model : nn.Module, eval_loader : DataLoader, processor : Any, n_gpu : int, device : torch.device) -> Dict:
     """
     Inference.
     Args:
@@ -156,7 +188,20 @@ def inference(args : argparse.Namespace, model : nn.Module, eval_loader : DataLo
         predictions = _inference(args, model, batch, processor, predictions, n_gpu, device)
     return predictions
 
-def SomDst_inference(model, eval_examples, processor, slot_meta, tokenizer, op_code = '4'):
+def SomDst_inference(model : nn.Module, eval_examples : List[DSTInputExample], processor : SOMDSTPreprocessor, slot_meta : List[str], tokenizer : BertTokenizer, op_code : str = '4') -> Dict[str, List[str]]:
+    """SOMDST Inference
+
+    Args:
+        model (nn.Module)
+        eval_examples (List[DSTInputExample])
+        processor (SOMDSTPreprocessor)
+        slot_meta (List[str])
+        tokenizer (BertTokenizer)
+        op_code (str, optional). Defaults to '4'.
+
+    Returns:
+        Dict[str, List[str]]: Predict slot value
+    """
     op2id = OP_SET[op_code]
     id2op = {v: k for k, v in op2id.items()}
     predictions = {}
@@ -164,9 +209,11 @@ def SomDst_inference(model, eval_examples, processor, slot_meta, tokenizer, op_c
     for i in tqdm(eval_examples):
         turn_id = int(i.guid.split('-')[-1])
 
+        # 첫번째 turn일 때 last dialog state는 없음
         if turn_id == 0:
             last_dialog_state = {}
 
+        # 이전 dialog를 반영해서 data를 구축
         i.last_dialog_state = deepcopy(last_dialog_state)
         test_feature = processor._convert_example_to_feature(i)
         test_dataset = WOSDataset([test_feature])
@@ -187,8 +234,10 @@ def SomDst_inference(model, eval_examples, processor, slot_meta, tokenizer, op_c
                             max_value=MAX_LENGTH,
                             )
 
+        # operation id 예측
         _, op_ids = s.view(-1, len(op2id)).max(-1)
 
+        # generation id 예측
         if g.size(1) > 0:
             generated = g.squeeze(0).max(-1)[1].tolist()
         else:
