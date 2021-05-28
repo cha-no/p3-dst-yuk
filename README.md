@@ -27,3 +27,5 @@ train.py --architecture TRADE_transformer
 python inference.py --model_name "SOMDST/model-50.bin"
 
 ```
+
+## Experimental records are summarized in 
