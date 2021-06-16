@@ -78,7 +78,7 @@ SOMDST는 기존의 모델들과 데이터와 다른 WOZ데이터를 사용했�
 
 **-> WOS데이터에 맞게 코드통합**
 
-### [회고록](https://github.com/cha-no/p3-dst-yuk/blob/master/report.pdf)
+### [회고록](https://www.notion.so/d99b04e41b514b43940a9d59f79b6f58)
 
 ## usage
 ```python
