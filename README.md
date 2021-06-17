@@ -10,7 +10,6 @@
   - [TRADE Transformer Decoder](#trade-transformer-decoder)
 - [Problem](#problem)
   - [회고록](#회고록)
-- [Usage](#usage)
 
 ## 프로젝트 소개
 
