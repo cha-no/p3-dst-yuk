@@ -67,8 +67,8 @@ SUMBT는 Ontology Based Model이기 때문에 Ontology 집합에서 value를 선
 
 **-> Open Vocab Based Model으로 해결**
 
-### 2. 너무 오래걸리는 학습시간
-TRADE모델은 모든 Slot에 대해 value를 생성하므로 시간이 오래 걸립니다. 
+### 2. 너무 많은 메모리 사용량
+TRADE모델은 모든 Slot에 대해 value를 생성하므로 메모리 사용량이 많습니다. 
 
 **-> SOMDST로 해결**
 
